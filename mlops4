@@ -1,0 +1,399 @@
+import os, json, math, shutil
+import numpy as np
+import tensorflow as tf
+# environment variables used by bash cells
+PROJECT=!(gcloud config get-value project)
+PROJECT=PROJECT[0]
+REGION = 'us-central1'
+BUCKET='{}-dsongcp'.format(PROJECT)
+os.environ['ENDPOINT_NAME'] = 'flights'
+os.environ['BUCKET'] = BUCKET
+os.environ['REGION'] = REGION
+os.environ['TF_VERSION']='2-' + tf.__version__[2:3]
+
+%%bigquery
+CREATE OR REPLACE TABLE dsongcp.flights_train_data AS
+SELECT
+  IF(arr_delay < 15, 1.0, 0.0) AS ontime,
+  dep_delay,
+  taxi_out,
+  distance,
+  origin,
+  dest,
+  EXTRACT(hour FROM dep_time) AS dep_hour,
+  IF (EXTRACT(dayofweek FROM dep_time) BETWEEN 2 AND 6, 1, 0) AS is_weekday,
+  UNIQUE_CARRIER AS carrier,
+  dep_airport_lat,
+  dep_airport_lon,
+  arr_airport_lat,
+  arr_airport_lon
+FROM dsongcp.flights_tzcorr f
+JOIN dsongcp.trainday t
+ON f.FL_DATE = t.FL_DATE
+WHERE
+  f.CANCELLED = False AND 
+  f.DIVERTED = False AND
+  is_train_day = 'True'
+
+%%bigquery
+CREATE OR REPLACE TABLE dsongcp.flights_eval_data AS
+SELECT
+  IF(arr_delay < 15, 1.0, 0.0) AS ontime,
+  dep_delay,
+  taxi_out,
+  distance,
+  origin,
+  dest,
+  EXTRACT(hour FROM dep_time) AS dep_hour,
+  IF (EXTRACT(dayofweek FROM dep_time) BETWEEN 2 AND 6, 1, 0) AS is_weekday,
+  UNIQUE_CARRIER AS carrier,
+  dep_airport_lat,
+  dep_airport_lon,
+  arr_airport_lat,
+  arr_airport_lon
+FROM dsongcp.flights_tzcorr f
+JOIN dsongcp.trainday t
+ON f.FL_DATE = t.FL_DATE
+WHERE
+  f.CANCELLED = False AND 
+  f.DIVERTED = False AND
+  is_train_day = 'False'
+
+gquery
+CREATE OR REPLACE TABLE dsongcp.flights_all_data AS
+SELECT
+  IF(arr_delay < 15, 1.0, 0.0) AS ontime,
+  dep_delay,
+  taxi_out,
+  distance,
+  origin,
+  dest,
+  EXTRACT(hour FROM dep_time) AS dep_hour,
+  IF (EXTRACT(dayofweek FROM dep_time) BETWEEN 2 AND 6, 1, 0) AS is_weekday,
+  UNIQUE_CARRIER AS carrier,
+  dep_airport_lat,
+  dep_airport_lon,
+  arr_airport_lat,
+  arr_airport_lon,
+  IF (is_train_day = 'True',
+      IF(ABS(MOD(FARM_FINGERPRINT(CAST(f.FL_DATE AS STRING)), 100)) < 60, 'TRAIN', 'VALIDATE'),
+      'TEST') AS data_split
+FROM dsongcp.flights_tzcorr f
+JOIN dsongcp.trainday t
+ON f.FL_DATE = t.FL_DATE
+WHERE
+  f.CANCELLED = False AND 
+  f.DIVERTED = False
+
+%%bash
+PROJECT=$(gcloud config get-value project)
+for dataset in "train" "eval" "all"; do
+  TABLE=dsongcp.flights_${dataset}_data
+  CSV=gs://${BUCKET}/ch9/data/${dataset}.csv
+  echo "Exporting ${TABLE} to ${CSV} and deleting table"
+  bq --project_id=${PROJECT} extract --destination_format=CSV $TABLE $CSV
+  bq --project_id=${PROJECT} rm -f $TABLE
+done
+
+!gsutil ls -lh gs://{BUCKET}/ch9/data
+
+DEVELOP_MODE = True
+NUM_EXAMPLES = 5000*1000
+
+training_data_uri = 'gs://{}/ch9/data/train*'.format(BUCKET)
+validation_data_uri = 'gs://{}/ch9/data/eval*'.format(BUCKET)
+
+NBUCKETS = 5
+NEMBEDS = 3
+TRAIN_BATCH_SIZE = 64
+DNN_HIDDEN_UNITS = '64,32'
+
+if DEVELOP_MODE:
+    train_df = tf.data.experimental.make_csv_dataset(training_data_uri, batch_size=5)
+    for n, data in enumerate(train_df):
+        numpy_data = {k: v.numpy() for k, v in data.items()}
+        print(n, numpy_data)
+        if n==1: break
+
+def features_and_labels(features):
+  label = features.pop('ontime') 
+  return features, label
+def read_dataset(pattern, batch_size, mode=tf.estimator.ModeKeys.TRAIN, truncate=None):
+  dataset = tf.data.experimental.make_csv_dataset(pattern, batch_size, num_epochs=1)
+  dataset = dataset.map(features_and_labels)
+  if mode == tf.estimator.ModeKeys.TRAIN:
+    dataset = dataset.shuffle(batch_size*10)
+    dataset = dataset.repeat()
+  dataset = dataset.prefetch(1)
+  if truncate is not None:
+    dataset = dataset.take(truncate)
+  return dataset
+if DEVELOP_MODE:
+    print("Checking input pipeline")
+    one_item = read_dataset(training_data_uri, batch_size=2, truncate=1)
+    print(list(one_item)) # should print one batch of 2 items
+
+import tensorflow as tf
+real = {
+    colname : tf.feature_column.numeric_column(colname) 
+          for colname in 
+            (
+                'dep_delay,taxi_out,distance,dep_hour,is_weekday,' +
+                'dep_airport_lat,dep_airport_lon,' +
+                'arr_airport_lat,arr_airport_lon'
+            ).split(',')
+}
+sparse = {
+      'carrier': tf.feature_column.categorical_column_with_vocabulary_list('carrier',
+                  vocabulary_list='AS,VX,F9,UA,US,WN,HA,EV,MQ,DL,OO,B6,NK,AA'.split(',')),
+      'origin' : tf.feature_column.categorical_column_with_hash_bucket('origin', hash_bucket_size=1000),
+      'dest'   : tf.feature_column.categorical_column_with_hash_bucket('dest', hash_bucket_size=1000),
+}
+
+inputs = {
+    colname : tf.keras.layers.Input(name=colname, shape=(), dtype='float32') 
+          for colname in real.keys()
+}
+inputs.update({
+    colname : tf.keras.layers.Input(name=colname, shape=(), dtype='string') 
+          for colname in sparse.keys()
+})
+
+latbuckets = np.linspace(20.0, 50.0, NBUCKETS).tolist()  # USA
+lonbuckets = np.linspace(-120.0, -70.0, NBUCKETS).tolist() # USA
+disc = {}
+disc.update({
+       'd_{}'.format(key) : tf.feature_column.bucketized_column(real[key], latbuckets) 
+          for key in ['dep_airport_lat', 'arr_airport_lat']
+})
+disc.update({
+       'd_{}'.format(key) : tf.feature_column.bucketized_column(real[key], lonbuckets) 
+          for key in ['dep_airport_lon', 'arr_airport_lon']
+})
+# cross columns that make sense in combination
+sparse['dep_loc'] = tf.feature_column.crossed_column(
+    [disc['d_dep_airport_lat'], disc['d_dep_airport_lon']], NBUCKETS*NBUCKETS)
+sparse['arr_loc'] = tf.feature_column.crossed_column(
+    [disc['d_arr_airport_lat'], disc['d_arr_airport_lon']], NBUCKETS*NBUCKETS)
+sparse['dep_arr'] = tf.feature_column.crossed_column([sparse['dep_loc'], sparse['arr_loc']], NBUCKETS ** 4)
+# embed all the sparse columns
+embed = {
+       'embed_{}'.format(colname) : tf.feature_column.embedding_column(col, NEMBEDS)
+          for colname, col in sparse.items()
+}
+real.update(embed)
+# one-hot encode the sparse columns
+sparse = {
+    colname : tf.feature_column.indicator_column(col)
+          for colname, col in sparse.items()
+}
+if DEVELOP_MODE:
+    print(sparse.keys())
+    print(real.keys())
+
+output_dir='gs://{}/ch9/trained_model'.format(BUCKET)
+os.environ['OUTDIR'] = output_dir  # needed for deployment
+print('Writing trained model to {}'.format(output_dir))
+
+!gsutil -m rm -rf $OUTDIR
+
+# Build a wide-and-deep model.
+def wide_and_deep_classifier(inputs, linear_feature_columns, dnn_feature_columns, dnn_hidden_units):
+    deep = tf.keras.layers.DenseFeatures(dnn_feature_columns, name='deep_inputs')(inputs)
+    layers = [int(x) for x in dnn_hidden_units.split(',')]
+    for layerno, numnodes in enumerate(layers):
+        deep = tf.keras.layers.Dense(numnodes, activation='relu', name='dnn_{}'.format(layerno+1))(deep)        
+    wide = tf.keras.layers.DenseFeatures(linear_feature_columns, name='wide_inputs')(inputs)
+    both = tf.keras.layers.concatenate([deep, wide], name='both')
+    output = tf.keras.layers.Dense(1, activation='sigmoid', name='pred')(both)
+    model = tf.keras.Model(inputs, output)
+    model.compile(optimizer='adam',
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
+    return model
+    
+model = wide_and_deep_classifier(
+    inputs,
+    linear_feature_columns = sparse.values(),
+    dnn_feature_columns = real.values(),
+    dnn_hidden_units = DNN_HIDDEN_UNITS)
+tf.keras.utils.plot_model(model, 'flights_model.png', show_shapes=False, rankdir='LR')
+
+# training and evaluation dataset
+train_batch_size = TRAIN_BATCH_SIZE
+if DEVELOP_MODE:
+    eval_batch_size = 100
+    steps_per_epoch = 3
+    epochs = 2
+    num_eval_examples = eval_batch_size*10
+else:
+    eval_batch_size = 100
+    steps_per_epoch = NUM_EXAMPLES // train_batch_size
+    epochs = 10
+    num_eval_examples = eval_batch_size * 100
+train_dataset = read_dataset(training_data_uri, train_batch_size)
+eval_dataset = read_dataset(validation_data_uri, eval_batch_size, tf.estimator.ModeKeys.EVAL, num_eval_examples)
+checkpoint_path = '{}/checkpoints/flights.cpt'.format(output_dir)
+shutil.rmtree(checkpoint_path, ignore_errors=True)
+cp_callback = tf.keras.callbacks.ModelCheckpoint(checkpoint_path, 
+                                                 save_weights_only=True,
+                                                 verbose=1)
+history = model.fit(train_dataset, 
+                    validation_data=eval_dataset,
+                    epochs=epochs, 
+                    steps_per_epoch=steps_per_epoch,
+                    callbacks=[cp_callback])
+
+import matplotlib.pyplot as plt
+nrows = 1
+ncols = 2
+fig = plt.figure(figsize=(10, 5))
+for idx, key in enumerate(['loss', 'accuracy']):
+    ax = fig.add_subplot(nrows, ncols, idx+1)
+    plt.plot(history.history[key])
+    plt.plot(history.history['val_{}'.format(key)])
+    plt.title('model {}'.format(key))
+    plt.ylabel(key)
+    plt.xlabel('epoch')
+    plt.legend(['train', 'validation'], loc='upper left');
+
+import time
+export_dir = '{}/export/flights_{}'.format(output_dir, time.strftime("%Y%m%d-%H%M%S"))
+print('Exporting to {}'.format(export_dir))
+tf.saved_model.save(model, export_dir)
+
+%%bash
+# note TF_VERSION and ENDPOINT_NAME set in 1st cell
+# TF_VERSION=2-6
+# ENDPOINT_NAME=flights
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+MODEL_NAME=${ENDPOINT_NAME}-${TIMESTAMP}
+EXPORT_PATH=$(gsutil ls ${OUTDIR}/export | tail -1)
+echo $EXPORT_PATH
+# create the model endpoint for deploying the model
+if [[ $(gcloud beta ai endpoints list --region=$REGION \
+        --format='value(DISPLAY_NAME)' --filter=display_name=${ENDPOINT_NAME}) ]]; then
+    echo "Endpoint for $MODEL_NAME already exists"
+else
+    echo "Creating Endpoint for $MODEL_NAME"
+    gcloud beta ai endpoints create --region=${REGION} --display-name=${ENDPOINT_NAME}
+fi
+ENDPOINT_ID=$(gcloud beta ai endpoints list --region=$REGION \
+              --format='value(ENDPOINT_ID)' --filter=display_name=${ENDPOINT_NAME})
+echo "ENDPOINT_ID=$ENDPOINT_ID"
+# delete any existing models with this name
+for MODEL_ID in $(gcloud beta ai models list --region=$REGION --format='value(MODEL_ID)' --filter=display_name=${MODEL_NAME}); do
+    echo "Deleting existing $MODEL_NAME ... $MODEL_ID "
+    gcloud ai models delete --region=$REGION $MODEL_ID
+done
+# create the model using the parameters docker conatiner image and artifact uri
+gcloud beta ai models upload --region=$REGION --display-name=$MODEL_NAME \
+     --container-image-uri=us-docker.pkg.dev/vertex-ai/prediction/tf2-cpu.${TF_VERSION}:latest \
+     --artifact-uri=$EXPORT_PATH
+MODEL_ID=$(gcloud beta ai models list --region=$REGION --format='value(MODEL_ID)' --filter=display_name=${MODEL_NAME})
+echo "MODEL_ID=$MODEL_ID"
+# deploy the model to the endpoint
+gcloud beta ai endpoints deploy-model $ENDPOINT_ID \
+  --region=$REGION \
+  --model=$MODEL_ID \
+  --display-name=$MODEL_NAME \
+  --machine-type=n1-standard-2 \
+  --min-replica-count=1 \
+  --max-replica-count=1 \
+  --traffic-split=0=100
+
+%%writefile example_input.json
+{"instances": [
+  {"dep_hour": 2, "is_weekday": 1, "dep_delay": 40, "taxi_out": 17, "distance": 41, "carrier": "AS", "dep_airport_lat": 58.42527778, "dep_airport_lon": -135.7075, "arr_airport_lat": 58.35472222, "arr_airport_lon": -134.57472222, "origin": "GST", "dest": "JNU"},
+  {"dep_hour": 22, "is_weekday": 0, "dep_delay": -7, "taxi_out": 7, "distance": 201, "carrier": "HA", "dep_airport_lat": 21.97611111, "dep_airport_lon": -159.33888889, "arr_airport_lat": 20.89861111, "arr_airport_lon": -156.43055556, "origin": "LIH", "dest": "OGG"}
+]}
+
+%%bash
+ENDPOINT_ID=$(gcloud beta ai endpoints list --region=$REGION \
+              --format='value(ENDPOINT_ID)' --filter=display_name=${ENDPOINT_NAME})
+echo $ENDPOINT_ID
+gcloud beta ai endpoints predict $ENDPOINT_ID --region=$REGION --json-request=example_input.json
+
+%%bash
+PROJECT=$(gcloud config get-value project)
+ENDPOINT_ID=$(gcloud beta ai endpoints list --region=$REGION \
+              --format='value(ENDPOINT_ID)' --filter=display_name=${ENDPOINT_NAME})
+curl -X POST \
+  -H "Authorization: Bearer "$(gcloud auth application-default print-access-token) \
+  -H "Content-Type: application/json; charset=utf-8" \
+  -d @example_input.json \
+  "https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT}/locations/${REGION}/endpoints/${ENDPOINT_ID}:predict"
+
+### model explainability
+%%bash
+model_dir=$(gsutil ls ${OUTDIR}/export | tail -1)
+echo $model_dir
+saved_model_cli show --tag_set serve --signature_def serving_default --dir $model_dir
+
+
+cols = ('dep_delay,taxi_out,distance,dep_hour,is_weekday,' +
+        'dep_airport_lat,dep_airport_lon,' +
+        'arr_airport_lat,arr_airport_lon,' +
+        'carrier,origin,dest')
+inputs = {x: {"inputTensorName": "{}".format(x)} 
+        for x in cols.split(',')}
+expl = {
+    "inputs": inputs,
+    "outputs": {
+    "pred": {
+      "outputTensorName": "pred"
+    }
+  }
+}
+print(expl)
+with open('explanation-metadata.json', 'w') as ofp:
+    json.dump(expl, ofp, indent=2)
+
+### explainability in JSON
+!cat explanation-metadata.json
+
+## deploy model to Vertex AI
+%%bash
+# note TF_VERSION set in 1st cell, but ENDPOINT_NAME is being changed
+# TF_VERSION=2-6
+ENDPOINT_NAME=flights_xai
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+MODEL_NAME=${ENDPOINT_NAME}-${TIMESTAMP}
+EXPORT_PATH=$(gsutil ls ${OUTDIR}/export | tail -1)
+echo $EXPORT_PATH
+# create the model endpoint for deploying the model
+if [[ $(gcloud beta ai endpoints list --region=$REGION \
+        --format='value(DISPLAY_NAME)' --filter=display_name=${ENDPOINT_NAME}) ]]; then
+    echo "Endpoint for $MODEL_NAME already exists"
+else
+    # create model endpoint
+    echo "Creating Endpoint for $MODEL_NAME"
+    gcloud beta ai endpoints create --region=${REGION} --display-name=${ENDPOINT_NAME}
+fi
+ENDPOINT_ID=$(gcloud beta ai endpoints list --region=$REGION \
+              --format='value(ENDPOINT_ID)' --filter=display_name=${ENDPOINT_NAME})
+echo "ENDPOINT_ID=$ENDPOINT_ID"
+# delete any existing models with this name
+for MODEL_ID in $(gcloud beta ai models list --region=$REGION --format='value(MODEL_ID)' --filter=display_name=${MODEL_NAME}); do
+    echo "Deleting existing $MODEL_NAME ... $MODEL_ID "
+    gcloud ai models delete --region=$REGION $MODEL_ID
+done
+# upload the model using the parameters docker conatiner image, artifact URI, explanation method, 
+# explanation path count and explanation metadata JSON file `explanation-metadata.json`. 
+# Here, you keep number of feature permutations to `10` when approximating the Shapley values for explanation.
+gcloud beta ai models upload --region=$REGION --display-name=$MODEL_NAME \
+     --container-image-uri=us-docker.pkg.dev/vertex-ai/prediction/tf2-cpu.${TF_VERSION}:latest \
+     --artifact-uri=$EXPORT_PATH \
+     --explanation-method=sampled-shapley --explanation-path-count=10 --explanation-metadata-file=explanation-metadata.json
+MODEL_ID=$(gcloud beta ai models list --region=$REGION --format='value(MODEL_ID)' --filter=display_name=${MODEL_NAME})
+echo "MODEL_ID=$MODEL_ID"
+# deploy the model to the endpoint
+gcloud beta ai endpoints deploy-model $ENDPOINT_ID \
+  --region=$REGION \
+  --model=$MODEL_ID \
+  --display-name=$MODEL_NAME \
+  --machine-type=n1-standard-2 \
+  --min-replica-count=1 \
+  --max-replica-count=1 \
+  --traffic-split=0=100
+
